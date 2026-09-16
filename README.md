@@ -52,37 +52,131 @@ The default work-efficient scan launches `2·log₂(n) + 1` kernels, and at the 
 
 | n | No tail (ms) | With tail (ms) | Speedup |
 |---:|---:|---:|---:|
-| 2^10 | 0.938 | 0.349 | **2.69x** |
-| 2^14 | 0.497 | 0.360 | **1.38x** |
-| 2^18 | 0.524 | 0.393 | **1.33x** |
-| 2^22 | 1.129 | 0.797 | **1.42x** |
-| 2^25 | 9.793 | 6.250 | **1.57x** |
+| 2^10 | 0.650 | 0.275 | **2.36×** |
+| 2^14 | 0.400 | 0.331 | **1.21×** |
+| 2^18 | 0.494 | 0.272 | **1.82×** |
+| 2^22 | 0.959 | 0.615 | **1.56×** |
+| 2^25 | 6.342 | 6.591 | 0.96× |
+
+The speedup is largest at small-to-mid `n`, where launch overhead dominates. At `2^25`, the multi-block portion is already doing almost all the work, so the tail saves only ~18 kernel launches out of 51 — under 1% of total time, within run-to-run noise. The multi-run compaction numbers tell the same story: `work-efficient compact` at `2^25` drops from 11.15 ms (no tail) to 9.69 ms (with tail), a ~1.15× win.
 
 ---
 
 ## Performance Analysis 
 ### <ins>Block Size Optimization</ins>
+Each GPU implementation was tested with the following block sizes `64, 128, 256, 512, 1024` at `n = 2^22` before final data collection, so the tables below compare roughly-optimized implementations rather than unoptimized ones.
+
+| blockSize | Naive (ms) | Efficient (ms) |
+|---:|---:|---:|
+| 64   | 1.934 | 2.840 |
+| 128  | 0.856 | 0.732 |
+| 256  | 0.880 | 1.074 |
+| 512  | 0.823 | 0.763 |
+| 1024 | 1.391 | 0.610 |
+
+<img alt="image" src="https://github.com/user-attachments/assets/c3f8b970-9499-400a-b6dd-f74f79c8962c" />
+
+I chose **blockSize = 512** for both implementations. It's the best Naive time, and works well for Efficient time. Performance across 128-512 was essentially flat, so any of those could work. However, 64 was too small (per-block `__syncthreads()` overhead) and 1024 hurts the memory-bound naive scan.
 
 
 ### <ins>GPU vs CPU Scan Comparison</ins>
-All measurements in **Release x64** on an RTX 4090 Laptop GPU, V-Sync off. Data collected by sweeping the test harness across five sizes (`SIZE = 2^10, 2^14, 2^18, 2^22, 2^25`) in a single process.
+All measurements in **Release x64** on an RTX 4090 Laptop GPU, V-Sync off. Data collected by sweeping the test harness across five sizes (`SIZE = 2^10, 2^14, 2^18, 2^22, 2^25`) in a single process. Every GPU implementation has `cudaMalloc`, `cudaMemset`, H2D `cudaMemcpy`, and the final D2H `cudaMemcpy` placed **outside** the `startGpuTimer() / endGpuTimer()` region — only kernels are timed. All GPU numbers use the block size chosen in Q1 (512).
+
+**Scan:**
 
 | n | CPU (ms) | Naive (ms) | Efficient (ms) | Thrust (ms) |
 |---:|---:|---:|---:|---:|
-| 2^10 | 0.0018 | 0.142 | 0.349 | 26.05 |
-| 2^14 | 0.0137 | 0.157 | 0.360 | 27.37 |
-| 2^18 | 0.217 | 0.364 | 0.393 | 26.86 |
-| 2^22 | 3.32 | 2.06 | 0.797 | 45.48 |
-| 2^25 | 36.87 | 26.21 | 6.25 | 125.18 |
+| 2^10 | 0.0007 | 0.136 | 0.275 | 0.092 |
+| 2^14 | 0.008 | 0.178 | 0.331 | 0.112 |
+| 2^18 | 0.098 | 0.307 | 0.272 | 0.489 |
+| 2^22 | 1.733 | 0.831 | 0.615 | 0.531 |
+| 2^25 | 15.41 | 20.95 | 6.591 | 1.360 |
 
-<img alt="image" src="https://github.com/user-attachments/assets/424d5dc7-eb7d-4870-a817-ab0871dc2ceb" />
+<img alt="image" src="https://github.com/user-attachments/assets/ced4beac-ed56-4735-a0f1-2b0e8528a275" />
 
-**Brief explanation of the phenomena:** At small `n` the CPU wins outright — the GPU implementations pay a fixed kernel-launch overhead per level that swamps the actual work. The crossover between CPU and Efficient is around `n = 2^20`. Naive and Efficient have the same order of memory traffic, but Efficient does `O(n)` additions vs Naive's `O(n log n)`, which shows up as a 4.2× gap at `2^25`.
+**Compaction:**
+
+| n | CPU w/o scan (ms) | CPU w/ scan (ms) | Efficient GPU (ms) |
+|---:|---:|---:|---:|
+| 2^10 | 0.002 | 0.014 | 0.194 |
+| 2^14 | 0.029 | 0.062 | 0.182 |
+| 2^18 | 0.476 | 1.251 | 0.269 |
+| 2^22 | 7.872 | 19.642 | 0.747 |
+| 2^25 | 61.37 | 153.81 | 9.685 |
+
+<img alt="image" src="https://github.com/user-attachments/assets/9fdada74-aa30-419d-ac0d-dc76f3dfb8ae" />
+
+At small `n` the CPU wins outright. The GPU implementations pay a fixed kernel-launch overhead per level that swamps the actual work. For **scan**, the CPU and Efficient crossover is around `n = 2^18`; for **compaction** it happens earlier, around `n = 2^16`, because GPU compaction does only one scan plus a scatter while CPU `compactWithScan` does three serial passes with two host-side allocations. Naive and Efficient have the same order of memory traffic, but Efficient does `O(n)` additions vs Naive's `O(n log n)`, which shows up as a ~3.2× gap at `2^25`. Thrust is now competitive with my Efficient at small-to-mid `n` because running all five sizes in a single process amortizes its one-time module/context initialization. At `2^25` it pulls ahead (1.36 ms vs 6.59 ms), which is the expected payoff of its blocked two-level scan: only 3–5 kernel launches total versus my `2*log_2(n) + 1` (51 launches at that size), and it moves `O(n)` bytes per pass instead of one full pass per level.
 
 
 ### <ins>What's Happening Inside Thrust?</ins>
+Thrust's `exclusive_scan` uses a **two-level blocked scan** rather than my per-level sweep: each block does a local scan entirely in shared memory and writes out only its block sum, then a small kernel scans the block sums, then a third kernel adds each block's prefix back to its elements. This is 3–5 kernel launches total regardless of `n`, versus my `2*log_2(n) + 1` (51 launches at `2^25`). It also moves ~O(n) bytes per pass, not one full pass per level, which is why Thrust pulls ahead of my Efficient at `2^25` (1.36 ms vs 6.59 ms — a 4.8× gap). At small-to-mid `n` Thrust is competitive with my Efficient because running all five sizes in a single process amortizes its one-time module/context initialization (~26 ms in the earlier per-process runs). *(I didn't need Nsight to explain this — the timing shape across sizes is enough to see that Thrust's cost grows far more slowly with `n` than mine.)*
 
 
 ### <ins>Performance Bottlenecks: Memory I/O or Computation?</ins>
+- **Small n (≤ 2^14)**: launch overhead. Both CPU and GPU are fast enough that per-kernel fixed cost dominates, which is why the CPU (zero launches) wins outright up to ~`2^14`.
+- **Mid n (2^18)**: crossover region for Efficient vs CPU. GPU kernels are now doing enough work to amortize launches, but not yet bandwidth-bound.
+- **Large n (2^22–2^25)**: memory bandwidth. Every level of my sweep reads and writes the whole working array, so the total traffic is `O(n log n)` bytes despite `O(n)` adds. Naive scan pays the same traffic *plus* ~25× more additions, showing up as Naive taking 20.95 ms at `2^25` vs Efficient's 6.59 ms.
+- **Naive at 2^25** (20.95 ms) is actually *slower* than the CPU at 2^25 (15.41 ms) — the extra additions per level outweigh the GPU's parallelism advantage at that size.
+- **Compaction's scatter step** is bandwidth-bound (non-contiguous writes to `odata[indices[i]]`), but it's a small fraction of total time at large `n` where the scan dominates.
+- **CPU versions** are pure compute-bound — the serial running-sum dependency prevents ILP, so CPU scan time scales linearly and never catches the GPU once the arrays are big enough.
+- **Thrust** is the odd one out: its blocked approach reduces memory traffic and launch count, so it stays launch-overhead-limited through mid sizes and bandwidth-limited only at the very top. That's why it beats every other implementation at every size ≥ 2^14 in the final table.
+
 
 ### <ins>Full Test Output</ins>
+Run at `SIZE = 2^22`, `blockSize = 512`, `USE_TAIL = 1`, Release x64.
+
+```
+****************
+** SCAN TESTS **
+****************
+    [  49  36  38  26  15  25  29  11  26  37  15  46  16 ...  46   0 ]
+==== cpu scan, power-of-two ====
+   elapsed time: 1.911ms    (std::chrono Measured)
+    [   0  49  85 123 149 164 189 218 229 255 292 307 353 ... 102706625 102706671 ]
+==== cpu scan, non-power-of-two ====
+   elapsed time: 2.2651ms    (std::chrono Measured)
+    [   0  49  85 123 149 164 189 218 229 255 292 307 353 ... 102706562 102706608 ]
+    passed
+==== naive scan, power-of-two ====
+   elapsed time: 0.806272ms    (CUDA Measured)
+    passed
+==== naive scan, non-power-of-two ====
+   elapsed time: 0.650944ms    (CUDA Measured)
+    passed
+==== work-efficient scan, power-of-two ====
+   elapsed time: 0.742048ms    (CUDA Measured)
+    passed
+==== work-efficient scan, non-power-of-two ====
+   elapsed time: 0.636512ms    (CUDA Measured)
+    passed
+==== thrust scan, power-of-two ====
+   elapsed time: 0.515072ms    (CUDA Measured)
+    passed
+==== thrust scan, non-power-of-two ====
+   elapsed time: 0.43344ms    (CUDA Measured)
+    passed
+
+*****************************
+** STREAM COMPACTION TESTS **
+*****************************
+    [   3   0   0   2   1   3   3   1   2   3   1   0   0 ...   0   0 ]
+==== cpu compact without scan, power-of-two ====
+   elapsed time: 6.862ms    (std::chrono Measured)
+    [   3   2   1   3   3   1   2   3   1   2   2   2   1 ...   3   2 ]
+    passed
+==== cpu compact without scan, non-power-of-two ====
+   elapsed time: 6.9343ms    (std::chrono Measured)
+    [   3   2   1   3   3   1   2   3   1   2   2   2   1 ...   2   3 ]
+    passed
+==== cpu compact with scan ====
+   elapsed time: 14.6162ms    (std::chrono Measured)
+    [   3   2   1   3   3   1   2   3   1   2   2   2   1 ...   3   2 ]
+    passed
+==== work-efficient compact, power-of-two ====
+   elapsed time: 0.672192ms    (CUDA Measured)
+    passed
+==== work-efficient compact, non-power-of-two ====
+   elapsed time: 0.568608ms    (CUDA Measured)
+    passed
+```
