@@ -77,7 +77,7 @@ namespace StreamCompaction {
         // device exclusive scan of dev_data in place
         void scanDevice(int n_pow2, int* dev_data) {
             int numLevels = ilog2ceil(n_pow2);
-            const int blockSize = 256;
+            const int blockSize = 512;
 
             if (numLevels == 0) {
 				kernZero<<<1, 1 >>>(0, dev_data);
@@ -209,7 +209,7 @@ namespace StreamCompaction {
 			cudaMemcpy(dev_idata, idata, n * sizeof(int), cudaMemcpyHostToDevice);
 			checkCUDAError("cudaMemcpy idata to dev_idata failed!");
 
-            const int blockSize = 256;
+            const int blockSize = 512;
             const int gridSize = (n + blockSize - 1) / blockSize;
 
             timer().startGpuTimer();

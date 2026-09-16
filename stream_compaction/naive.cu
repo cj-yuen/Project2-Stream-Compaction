@@ -57,7 +57,7 @@ namespace StreamCompaction {
             timer().startGpuTimer();
 
             int numLevels = ilog2ceil(n);
-            const int blockSize = 128;
+            const int blockSize = 512;
 			const int gridSize = (n + blockSize - 1) / blockSize;
 
             int* readFrom = dev_a;
