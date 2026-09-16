@@ -3,6 +3,8 @@
 #include "common.h"
 #include "efficient.h"
 
+#define USE_TAIL 1  // 0 --> disables tail optimization
+
 namespace StreamCompaction {
     namespace Efficient {
         using StreamCompaction::Common::PerformanceTimer;
@@ -44,13 +46,58 @@ namespace StreamCompaction {
             }
         }
 
+        __global__ void kernUpsweepTail(int n_pow2, int startD, int numLevels, int* data) {
+            for (int d = startD; d < numLevels; ++d) {
+                int count = n_pow2 >> (d + 1);
+                if (threadIdx.x < count) {
+                    int pos = (threadIdx.x << (d + 1)) + (1 << (d + 1)) - 1;
+                    int stride = 1 << d;
+                    data[pos] += data[pos - stride];
+                }
+
+                __syncthreads();
+            }
+        }
+
+        __global__ void kernDownsweepTail(int n_pow2, int startD, int endD, int* data) {
+            for (int d = startD; d >= endD; --d) {
+                int count = n_pow2 >> (d + 1);
+                if (threadIdx.x < count) {
+                    int pos = (threadIdx.x << (d + 1)) + (1 << (d + 1)) - 1;
+                    int stride = 1 << d;
+                    int left = data[pos - stride];
+                    data[pos - stride] = data[pos];
+                    data[pos] += left;
+                }
+
+                __syncthreads();
+            }
+		}
+
         // device exclusive scan of dev_data in place
         void scanDevice(int n_pow2, int* dev_data) {
             int numLevels = ilog2ceil(n_pow2);
             const int blockSize = 256;
 
-            // upsweep 
+            if (numLevels == 0) {
+				kernZero<<<1, 1 >>>(0, dev_data);
+                checkCUDAError("kernZero failed!");
+				return;
+            }
+
+            // find 1st level w/ count < blockSize
+            int cutoffD = numLevels;
             for (int d = 0; d < numLevels; ++d) {
+                int count = n_pow2 >> (d + 1);
+                if (count <= blockSize) {
+                    cutoffD = d;
+                    break;
+                }
+			}
+
+            // upsweep 
+            int upStart = USE_TAIL ? cutoffD : numLevels;
+            for (int d = 0; d < upStart; ++d) {
                 int count = n_pow2 >> (d + 1);
                 int gridSize = (count + blockSize - 1) / blockSize;
                 
@@ -58,12 +105,26 @@ namespace StreamCompaction {
 				checkCUDAError("kernUpsweep failed!");
             }
 
+#if USE_TAIL
+            if (cutoffD < numLevels) {
+				kernUpsweepTail<<<1, blockSize>>>(n_pow2, cutoffD, numLevels, dev_data);
+				checkCUDAError("kernUpsweepTail failed!");
+            }
+#endif
+
             // set root --> 0
             kernZero<<<1, 1 >>>(n_pow2 - 1, dev_data);
 			checkCUDAError("kernZero failed!");
 
             // downsweep
-            for (int d = numLevels - 1; d >= 0; --d) {
+#if USE_TAIL
+            if (cutoffD < numLevels) {
+				kernDownsweepTail<<<1, blockSize>>>(n_pow2, numLevels - 1, cutoffD, dev_data);
+				checkCUDAError("kernDownsweepTail failed!");
+            }
+#endif 
+			int downStop = USE_TAIL ? cutoffD - 1 : numLevels - 1;
+            for (int d = downStop; d >= 0; --d) {
 				int count = n_pow2 >> (d + 1);
                 int gridSize = (count + blockSize - 1) / blockSize;
 
