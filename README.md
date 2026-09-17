@@ -16,7 +16,7 @@ This pipeline has 3 steps:
 2) **Scan** - exclusive prefix sum over the mapped array giving each nonzero element its output index
 3) **Scatter** - nonzero elements are written to `odata[indices[i]]`
 
-Scan has 2 parallel variants on GPU: 
+There are 2 parallel scan variants on GPU:
 * **Naive** - `O(n log n)` work, no race condition but heavy
 * **Work-Efficient** - `O(n)` work via binary tree up-sweep & down-sweep
 
@@ -32,33 +32,45 @@ Scan has 2 parallel variants on GPU:
 ---
 
 ## Part 1: CPU Scan & Stream Compaction
-Three serial loops. `scan` is the classic single-pass exclusive prefix sum — write the running total, then add the current element. `compactWithoutScan` uses a single write pointer to copy every nonzero element forward in order. `compactWithScan` does map → scan → scatter in three passes, matching the GPU pipeline structurally so I can compare its output against `compactWithoutScan`.
+Three serial loops:
+1) `scan` - the classic single-pass exclusive prefix sum where we write the running total and then add the current element. 
+2) `compactWithoutScan` - uses a single write pointer to copy every nonzero element forward in order.
+3) `compactWithScan` - does map $\rightarrow$ scan $\rightarrow$ scatter in three passes, matching the GPU pipeline structurally so I can compare its output against `compactWithoutScan`.
 
 ## Part 2: Naive GPU Scan
-Each level `d` uses an offset of `2^(d-1)`, and every element `k >= offset` sums itself with the element `offset` positions to its left, for `ilog2ceil(n)` levels. Since threads race when reading and writing the same array, we alternate between two device buffers (`dev_a` ↔ `dev_b`) each level. A final `kernShiftRight` shifts the inclusive result right by one and inserts 0 at index 0 to get the exclusive scan. Works for both power-of-two and non-power-of-two sizes.
+Each level `d` uses an offset of `2^(d-1)` and every element `k >= offset` sums itself with the element `offset` positions to its left for `ilog2ceil(n)` levels. Since threads race when reading and writing the same array, we alternate between two device buffers (`dev_a` $\leftrightarrow$ `dev_b`) each level. A final `kernShiftRight` shifts the inclusive result right by one and inserts 0 at index 0 to get the exclusive scan. This works for both power-of-two and non-power-of-two sizes.
 
 ## Part 3: Work-Efficient GPU Scan & Stream Compaction
-Based on GPU Gems 3, Chapter 39 - [Parallel Prefix Sum (Scan) with CUDA](https://developer.nvidia.com/gpugems/GPUGems3/gpugems3_ch39.html), operating on a power-of-two padded buffer. **Up-sweep** does a parallel reduction up the binary tree, **root-zero** sets the last element to 0, and **down-sweep** traverses back down, passing each node's value to its left child and setting its right child to the sum. Since no thread writes a location another thread reads in the same level, the scan runs fully in place.
+Based on GPU Gems 3, Chapter 39 - [Parallel Prefix Sum (Scan) with CUDA](https://developer.nvidia.com/gpugems/GPUGems3/gpugems3_ch39.html), operating on a power-of-two padded buffer. 
+1) **Up-sweep** - does a parallel reduction up the binary tree
+2) **Root Zero** - sets the last element to 0
+3) **Down-sweep** - traverses back down, passing each node's value to its left child and setting its right child to the sum
 
-Compaction wraps this: `kernMapToBoolean` produces the 0/1 array, `cudaMemcpy` moves it into the padded scan buffer, `scanDevice` exclusive-scans it, and `kernScatter` writes `idata[i]` to `odata[indices[i]]` wherever `bools[i] == 1`. To get the total count, I read back just the last scanned value plus the last input element — one int's worth of D2H traffic instead of a full reduction.
+Since no thread writes a location another thread reads in the same level, the scan runs fully in place.
 
-Non-power-of-two arrays are handled by rounding up to `n_pow2` and memset-ing the padding to 0.
+Compaction wraps this: 
+1) `kernMapToBoolean` - produces the 0/1 array
+2) `cudaMemcpy` - moves it into the padded scan buffer
+3) `scanDevice` - exclusive-scans it
+4) `kernScatter` - writes `idata[i]` to `odata[indices[i]]` wherever `bools[i] == 1`
+
+To get the total count, I read back just the last scanned value plus the last input element — one int's worth of D2H traffic instead of a full reduction. Also non-power-of-two arrays are handled by rounding up to `n_pow2` and memset-ing the padding to 0.
 
 ## Part 4: Using Thrust's Implementation
-A thin wrapper around `thrust::exclusive_scan`. I construct the device input and output vectors *outside* the timer so only the scan call is measured — this excludes the implicit H2D copy when building a `device_vector` from a `host_vector` and the final D2H `thrust::copy`. Added `#include <thrust/copy.h>` to pull in `thrust::copy`.
+A thin wrapper around `thrust::exclusive_scan`. I construct the device input and output vectors outside the timer so only the scan call is measured. This excludes the implicit host-to-device copy when building a `device_vector` from a `host_vector` and the final device-to-host `thrust::copy`. I also added `#include <thrust/copy.h>` to pull in `thrust::copy` as it was not running properly otherwise.
 
 ## Part 5: Tail Optimization (Extra Credit)
-The default work-efficient scan launches `2·log₂(n) + 1` kernels, and at the deepest levels `count = n_pow2 >> (d+1)` drops below `blockSize` — so the last few launches are full blocks where nearly every thread is idle. My optimization detects the first level where `count <= blockSize` and collapses all remaining levels of that sweep into a single-block kernel that loops over levels with `__syncthreads()` between them. Down-sweep mirrors this (descending `d`, args swapped). Kernel launches get cut roughly in half.
+The default work-efficient scan launches `2*log_2(n) + 1` kernels and at the deepest levels `count = n_pow2 >> (d+1)` drops below `blockSize`. Therefore the last few launches are full blocks where nearly every thread is idle. My optimization detects the first level where `count <= blockSize` and collapses all remaining levels of that sweep into a single block kernel that loops over levels with `__syncthreads()` between them. Down-sweep mirrors this. With these optimizations, kernel launches get cut roughly in half.
 
 | n | No tail (ms) | With tail (ms) | Speedup |
 |---:|---:|---:|---:|
-| 2^10 | 0.650 | 0.275 | **2.36×** |
-| 2^14 | 0.400 | 0.331 | **1.21×** |
-| 2^18 | 0.494 | 0.272 | **1.82×** |
-| 2^22 | 0.959 | 0.615 | **1.56×** |
-| 2^25 | 6.342 | 6.591 | 0.96× |
+| 2^10 | 0.650 | 0.275 | 2.36x |
+| 2^14 | 0.400 | 0.331 | 1.21x |
+| 2^18 | 0.494 | 0.272 | 1.82x |
+| 2^22 | 0.959 | 0.615 | 1.56x |
+| 2^25 | 6.342 | 6.591 | 0.96x |
 
-The speedup is largest at small-to-mid `n`, where launch overhead dominates. At `2^25`, the multi-block portion is already doing almost all the work, so the tail saves only ~18 kernel launches out of 51 — under 1% of total time, within run-to-run noise. The multi-run compaction numbers tell the same story: `work-efficient compact` at `2^25` drops from 11.15 ms (no tail) to 9.69 ms (with tail), a ~1.15× win.
+The speedup is most clearly seen at lower values of `n`, where the launch overhead has the most impact. At `n = 2^25`, the tail collapses the deepest 20 levels into just 2 kernels which brings the total of 51 launches down to 33. However, at this size, the multi-block portion is doing most of the work so the 2 tail kernels spend longer executing than the individual levels they replace, so the net time is roughly the same. 
 
 ---
 
@@ -66,7 +78,7 @@ The speedup is largest at small-to-mid `n`, where launch overhead dominates. At 
 ### <ins>Block Size Optimization</ins>
 Each GPU implementation was tested with the following block sizes `64, 128, 256, 512, 1024` at `n = 2^22` before final data collection, so the tables below compare roughly-optimized implementations rather than unoptimized ones.
 
-| blockSize | Naive (ms) | Efficient (ms) |
+| blockSize | Naive (ms) | Work-Efficient (ms) |
 |---:|---:|---:|
 | 64   | 1.934 | 2.840 |
 | 128  | 0.856 | 0.732 |
@@ -76,15 +88,15 @@ Each GPU implementation was tested with the following block sizes `64, 128, 256,
 
 <img alt="image" src="https://github.com/user-attachments/assets/c3f8b970-9499-400a-b6dd-f74f79c8962c" />
 
-I chose **blockSize = 512** for both implementations. It's the best Naive time, and works well for Efficient time. Performance across 128-512 was essentially flat, so any of those could work. However, 64 was too small (per-block `__syncthreads()` overhead) and 1024 hurts the memory-bound naive scan.
+I chose **blockSize = 512** for both implementations. It's the best Naive time and a reasonable choice for Work-Efficient time. Performance from 128-512 was essentially the same so any of those could work. However, 64 was too small and 1024 hurts the memory-bound naive scan.
 
 
 ### <ins>GPU vs CPU Scan Comparison</ins>
-All measurements in **Release x64** on an RTX 4090 Laptop GPU, V-Sync off. Data collected by sweeping the test harness across five sizes (`SIZE = 2^10, 2^14, 2^18, 2^22, 2^25`) in a single process. Every GPU implementation has `cudaMalloc`, `cudaMemset`, H2D `cudaMemcpy`, and the final D2H `cudaMemcpy` placed **outside** the `startGpuTimer() / endGpuTimer()` region — only kernels are timed. All GPU numbers use the block size chosen in Q1 (512).
+All measurements in **Release x64** on an RTX 4090 Laptop GPU, V-Sync off. Data collected by sweeping the test harness across five sizes (`SIZE = 2^10, 2^14, 2^18, 2^22, 2^25`). Every GPU implementation has its `cudaMalloc`, `cudaMemset`, `cudaMemcpy`, and the final `cudaMemcpy` operations placed outside the `startGpuTimer() / endGpuTimer()` region so only kernels are timed. All GPU numbers use the block size of 512.
 
 **Scan:**
 
-| n | CPU (ms) | Naive (ms) | Efficient (ms) | Thrust (ms) |
+| n | CPU (ms) | Naive (ms) | Work-Efficient (ms) | Thrust (ms) |
 |---:|---:|---:|---:|---:|
 | 2^10 | 0.0007 | 0.136 | 0.275 | 0.092 |
 | 2^14 | 0.008 | 0.178 | 0.331 | 0.112 |
@@ -96,7 +108,7 @@ All measurements in **Release x64** on an RTX 4090 Laptop GPU, V-Sync off. Data 
 
 **Compaction:**
 
-| n | CPU w/o scan (ms) | CPU w/ scan (ms) | Efficient GPU (ms) |
+| n | CPU w/o scan (ms) | CPU w/scan (ms) | Work-Efficient GPU (ms) |
 |---:|---:|---:|---:|
 | 2^10 | 0.002 | 0.014 | 0.194 |
 | 2^14 | 0.029 | 0.062 | 0.182 |
@@ -106,21 +118,39 @@ All measurements in **Release x64** on an RTX 4090 Laptop GPU, V-Sync off. Data 
 
 <img alt="image" src="https://github.com/user-attachments/assets/9fdada74-aa30-419d-ac0d-dc76f3dfb8ae" />
 
-At small `n` the CPU wins outright. The GPU implementations pay a fixed kernel-launch overhead per level that swamps the actual work. For **scan**, the CPU and Efficient crossover is around `n = 2^18`; for **compaction** it happens earlier, around `n = 2^16`, because GPU compaction does only one scan plus a scatter while CPU `compactWithScan` does three serial passes with two host-side allocations. Naive and Efficient have the same order of memory traffic, but Efficient does `O(n)` additions vs Naive's `O(n log n)`, which shows up as a ~3.2× gap at `2^25`. Thrust is now competitive with my Efficient at small-to-mid `n` because running all five sizes in a single process amortizes its one-time module/context initialization. At `2^25` it pulls ahead (1.36 ms vs 6.59 ms), which is the expected payoff of its blocked two-level scan: only 3–5 kernel launches total versus my `2*log_2(n) + 1` (51 launches at that size), and it moves `O(n)` bytes per pass instead of one full pass per level.
+At small `n` the CPU is much faster as the GPU implementations pay a fixed kernel-launch overhead per level. For **scan**, the Work-Efficient algorithm surpasses the CPU around `n = 2^18`. For **compaction** this happens earlier, around `n = 2^16`, as GPU compaction does only one scan + a scatter. On the other hand, CPU `compactWithScan` does three serial passes with two host-side allocations. Naive and Work-Efficient have the same order of memory traffic, but Work-Efficient does `O(n)` additions vs Naive's `O(n log n)`, which shows up as a ~3.2x gap at `2^25`. Thrust is also competitive with my Work-Efficient at small-to-mid `n` because I excluded the one-time module/context initialization when testing. At `2^25` it pulls ahead (1.36 ms vs 6.59 ms), which is the expected payoff.
 
 
 ### <ins>What's Happening Inside Thrust?</ins>
-Thrust's `exclusive_scan` uses a **two-level blocked scan** rather than my per-level sweep: each block does a local scan entirely in shared memory and writes out only its block sum, then a small kernel scans the block sums, then a third kernel adds each block's prefix back to its elements. This is 3–5 kernel launches total regardless of `n`, versus my `2*log_2(n) + 1` (51 launches at `2^25`). It also moves ~O(n) bytes per pass, not one full pass per level, which is why Thrust pulls ahead of my Efficient at `2^25` (1.36 ms vs 6.59 ms — a 4.8× gap). At small-to-mid `n` Thrust is competitive with my Efficient because running all five sizes in a single process amortizes its one-time module/context initialization (~26 ms in the earlier per-process runs). *(I didn't need Nsight to explain this — the timing shape across sizes is enough to see that Thrust's cost grows far more slowly with `n` than mine.)*
+Thrust's `exclusive_scan` uses a two-level blocked scan rather than my per-level sweep: each block does a local scan entirely in shared memory and writes out only its block sum. Then a small kernel scans the block sums, and a third kernel adds each block's prefix back to its elements. This is 3–5 kernel launches total regardless of `n`, versus my `2*log_2(n) + 1`. It also moves ~n bytes per pass, not one full pass per level, which is why Thrust pulls ahead of my Work-Efficient at `2^25` (1.36 ms vs 6.59 ms, a 4.8x gap). At lower to medium values of `n` Thrust is competitive with my Work-Efficient implementation because I excluded the one-time module/context initialization (~26 ms in the earlier tests).
+
+<img alt="image" src="https://github.com/user-attachments/assets/dec3bb57-9a11-472c-aa8c-e71bf1d72f0a" />
+One `StreamCompaction::Thrust::scan` call at n = 2^22. The scan itself (`thrust::exclusive_scan`, 644 µs) is a small fraction of the surrounding pipeline. The host-to-device `two_system_copy` (1.44 ms) and device-to-host `copy` (1.62 ms) together take ~5x longer than the scan. This is exactly why the assignment excludes memory operations from the timer.
 
 
 ### <ins>Performance Bottlenecks: Memory I/O or Computation?</ins>
-- **Small n (≤ 2^14)**: launch overhead. Both CPU and GPU are fast enough that per-kernel fixed cost dominates, which is why the CPU (zero launches) wins outright up to ~`2^14`.
-- **Mid n (2^18)**: crossover region for Efficient vs CPU. GPU kernels are now doing enough work to amortize launches, but not yet bandwidth-bound.
-- **Large n (2^22–2^25)**: memory bandwidth. Every level of my sweep reads and writes the whole working array, so the total traffic is `O(n log n)` bytes despite `O(n)` adds. Naive scan pays the same traffic *plus* ~25× more additions, showing up as Naive taking 20.95 ms at `2^25` vs Efficient's 6.59 ms.
-- **Naive at 2^25** (20.95 ms) is actually *slower* than the CPU at 2^25 (15.41 ms) — the extra additions per level outweigh the GPU's parallelism advantage at that size.
+The bottleneck shifts with array size:
+
+- **Small n ($\le$ 2^14)**: Both CPU and GPU are fast enough that per-kernel fixed cost dominates, which is why the CPU (zero launches) wins outright up to ~`2^14`. Therefore our bottleneck is the launch overhead. 
+- **Mid n (~2^18)**: GPU kernels are doing enough work to make the launch overhead neligible, but are not yet bandwidth-bound.
+- **Large n (2^22–2^25)**: Every level of my sweep reads and writes the whole working array, so the total traffic is `O(n log n)` bytes despite `O(n)` adds. Hence we are memory-bound.
+
+Within the large-`n` regime, the implementations differ:
+
+- **Naive scan** pays the same memory traffic as Work-Efficient but with around 25x more additions. This is why it takes 20.95 ms at `2^25` vs Work-Efficient's 6.59 ms and why it's actually slower than the CPU at the same size (15.41 ms). The extra additions per level outweigh the GPU's parallelism advantage.
+- **CPU versions** are pure compute-bound. The CPU scan time scales linearly and never catches the GPU once the arrays are big enough.
 - **Compaction's scatter step** is bandwidth-bound (non-contiguous writes to `odata[indices[i]]`), but it's a small fraction of total time at large `n` where the scan dominates.
-- **CPU versions** are pure compute-bound — the serial running-sum dependency prevents ILP, so CPU scan time scales linearly and never catches the GPU once the arrays are big enough.
-- **Thrust** is the odd one out: its blocked approach reduces memory traffic and launch count, so it stays launch-overhead-limited through mid sizes and bandwidth-limited only at the very top. That's why it beats every other implementation at every size ≥ 2^14 in the final table.
+- **Thrust** is the odd one out since its blocked approach reduces both memory traffic and launch count. Therefore it stays launch-limited through mid sizes and only becomes bandwidth-limited at the very top, which is why it beats every other implementation at every size $\ge$ 2^14 in the final table.
+
+<img alt="image" src="https://github.com/user-attachments/assets/3418e833-2636-4995-9216-825f69684360" />
+
+Nsight Systems capture of the compaction tests at n = 2^22. Green bars are host-to-device copies and the red bars are device-to-host copies. Even for memory-bound algorithms, the kernels barely register on the timeline. Most of the time is spent on the transfers.
+
+
+### <ins>Added Tests and Modifications</ins>
+- Added `#include <thrust/copy.h>` to `thrust.cu` as `thrust::copy` wasn't working properly.
+- Added a `#define USE_TAIL` toggle in `efficient.cu` to measure the tail optimization side-by-side with the baseline. Submitted version leaves it set to `1`.
+- No `CMakeLists.txt` changes.
 
 
 ### <ins>Full Test Output</ins>
